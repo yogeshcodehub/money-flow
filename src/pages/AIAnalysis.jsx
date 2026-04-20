@@ -212,7 +212,7 @@ Format with clear emoji section headers. Be specific with numbers. Keep it conci
     }
 
     setLoading(false);
-  }, [file, fileType, pdfBase64, csvData, callGemini]);
+  }, [file, fileType, pdfText, csvData, callGemini]);
 
   // ─── Import CSV to app ───
   const importCsvToApp = useCallback(() => {
