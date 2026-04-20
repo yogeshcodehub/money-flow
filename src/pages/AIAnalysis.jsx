@@ -6,16 +6,17 @@ import Papa from 'papaparse';
 // Gemini model
 const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
-// Extract text from PDF using pdfjs loaded from CDN (no npm install, no freeze)
+// Extract text from PDF using pdfjs loaded as global via index.html script tag
 async function extractPdfText(file) {
-  // Dynamically import pdfjs from CDN — loads async so it never blocks the UI
-  const pdfjs = await import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs');
+  const pdfjs = window.pdfjsLib;
+  if (!pdfjs) throw new Error('PDF library not loaded yet. Please refresh the page and try again.');
+
   pdfjs.GlobalWorkerOptions.workerSrc =
-    'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+    'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
 
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  const maxPages = Math.min(pdf.numPages, 15); // cap at 15 pages to stay within token limits
+  const maxPages = Math.min(pdf.numPages, 15);
   let text = '';
   for (let i = 1; i <= maxPages; i++) {
     const page = await pdf.getPage(i);
