@@ -3,26 +3,45 @@ import { useApp } from '../context/AppContext';
 import { formatCurrency, getCurrentMonth } from '../utils/constants';
 import Papa from 'papaparse';
 
-// Gemini endpoints
+// Gemini model
 const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
-// Convert file to base64 string (no heavy libraries needed)
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      // result is "data:application/pdf;base64,XXXX" — strip the prefix
-      const base64 = reader.result.split(',')[1];
-      resolve(base64);
-    };
-    reader.onerror = () => reject(new Error('Failed to read file'));
-    reader.readAsDataURL(file);
-  });
+// Extract text from PDF using pdfjs loaded from CDN (no npm install, no freeze)
+async function extractPdfText(file) {
+  // Dynamically import pdfjs from CDN — loads async so it never blocks the UI
+  const pdfjs = await import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs');
+  pdfjs.GlobalWorkerOptions.workerSrc =
+    'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  const maxPages = Math.min(pdf.numPages, 15); // cap at 15 pages to stay within token limits
+  let text = '';
+  for (let i = 1; i <= maxPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map((item) => item.str).join(' ') + '\n';
+  }
+  return text.trim();
 }
 
-// Truncate long strings so we don't hit token limits
-function truncate(str, max = 7000) {
-  return str.length > max ? str.slice(0, max) + '\n...[truncated for length]' : str;
+// Parse Gemini quota/rate errors into friendly messages
+function parseGeminiError(msg) {
+  if (msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+    return '⚠️ Gemini free tier quota exceeded. Options:\n1. Wait a few minutes and try again (daily quota resets at midnight Pacific)\n2. Get a new API key at aistudio.google.com/app/apikey\n3. Enable billing on your Google Cloud project for higher limits';
+  }
+  if (msg.includes('API_KEY_INVALID') || msg.includes('invalid api key')) {
+    return '❌ Invalid API key. Please check your key in Settings → AI Configuration.';
+  }
+  if (msg.includes('not found') || msg.includes('404')) {
+    return '❌ Gemini model not found. Please try again — the API may be temporarily unavailable.';
+  }
+  return msg;
+}
+
+// Truncate long text to stay within token limits (~4000 chars ≈ 1000 tokens)
+function truncate(str, max = 4000) {
+  return str.length > max ? str.slice(0, max) + '\n...[truncated]' : str;
 }
 
 export default function AIAnalysis() {
@@ -32,7 +51,7 @@ export default function AIAnalysis() {
   const [file, setFile] = useState(null);
   const [fileType, setFileType] = useState(''); // 'csv' | 'pdf'
   const [csvData, setCsvData] = useState(null);
-  const [pdfBase64, setPdfBase64] = useState('');
+  const [pdfText, setPdfText] = useState('');   // extracted text, not base64
 
   // UI state
   const [activeTab, setActiveTab] = useState('upload');
@@ -63,12 +82,11 @@ export default function AIAnalysis() {
     setFile(null);
     setFileType('');
     setCsvData(null);
-    setPdfBase64('');
+    setPdfText('');
     setAiResult('');
     setError('');
     setImported(false);
     setImportCount(0);
-    // Reset the actual file input
     if (fileRef.current) fileRef.current.value = '';
   }, []);
 
@@ -108,9 +126,13 @@ export default function AIAnalysis() {
           },
         });
       } else {
-        // PDF → base64 via FileReader (fast, no external lib, no freeze)
-        const b64 = await fileToBase64(f);
-        setPdfBase64(b64);
+        // PDF → extract text via pdfjs CDN (no npm install, no freeze, uses far fewer tokens)
+        const text = await extractPdfText(f);
+        if (!text) {
+          setError('No readable text found. This PDF may be a scanned image. Try exporting as CSV from your bank.');
+        } else {
+          setPdfText(text);
+        }
         setParseLoading(false);
       }
     } catch (err) {
@@ -167,35 +189,25 @@ export default function AIAnalysis() {
 Format with clear emoji section headers. Be specific with numbers. Keep it concise but insightful.`;
 
     try {
-      let parts;
+      let textContext;
 
       if (fileType === 'pdf') {
-        // Send PDF directly to Gemini — it reads PDFs natively! No heavy library needed.
-        parts = [
-          {
-            inline_data: {
-              mime_type: 'application/pdf',
-              data: pdfBase64,
-            },
-          },
-          { text: analysisPrompt },
-        ];
+        // Send only extracted text — dramatically fewer tokens (1-3k vs 44k for base64)
+        textContext = `Bank Statement PDF (${file.name})\n\nExtracted Text:\n${truncate(pdfText)}`;
       } else {
-        // Build CSV text context
         const cols = Object.keys(csvData[0] || {}).join(', ');
         const rows = csvData
-          .slice(0, 80)
+          .slice(0, 60)
           .map((row) => Object.values(row).join(' | '))
           .join('\n');
-        const context = `Bank Statement CSV (${csvData.length} rows)\nColumns: ${cols}\n\nData:\n${truncate(rows)}`;
-
-        parts = [{ text: `${analysisPrompt}\n\n${context}` }];
+        textContext = `Bank Statement CSV (${csvData.length} rows)\nColumns: ${cols}\n\nData:\n${truncate(rows)}`;
       }
 
-      const result = await callGemini(parts);
+      const fullPrompt = `${analysisPrompt}\n\n${textContext}`;
+      const result = await callGemini([{ text: fullPrompt }]);
       setAiResult(result);
     } catch (err) {
-      setError(err.message);
+      setError(parseGeminiError(err.message));
     }
 
     setLoading(false);
@@ -268,7 +280,7 @@ Answer helpfully, specifically, and concisely. Use emojis and numbers where rele
     setLoading(false);
   }, [question, loading, transactions, categories, getMonthStats, fmt, callGemini]);
 
-  const hasContent = fileType === 'csv' ? csvData !== null : pdfBase64 !== '';
+  const hasContent = fileType === 'csv' ? csvData !== null : pdfText !== '';
 
   // ─── Render ───
   return (
@@ -361,12 +373,12 @@ Answer helpfully, specifically, and concisely. Use emojis and numbers where rele
                 {parseLoading ? (
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 13 }}>
                     <div className="spinner animate-spin" />
-                    {fileType === 'pdf' ? 'Reading PDF...' : 'Parsing CSV...'}
+                    {fileType === 'pdf' ? 'Extracting text from PDF...' : 'Parsing CSV...'}
                   </div>
                 ) : hasContent ? (
                   <div style={{ color: 'var(--green)', fontWeight: 600, fontSize: 13 }}>
                     ✅ {fileType === 'pdf'
-                      ? 'PDF ready — Gemini will read it directly'
+                      ? `Text extracted (${pdfText.length.toLocaleString()} chars) — ready to analyze`
                       : `${csvData.length} rows detected`}
                   </div>
                 ) : null}
@@ -449,11 +461,18 @@ Answer helpfully, specifically, and concisely. Use emojis and numbers where rele
             </div>
           )}
 
-          {/* PDF info box */}
-          {fileType === 'pdf' && pdfBase64 && !parseLoading && (
-            <div className="alert alert-info" style={{ marginBottom: 16 }}>
-              🤖 Your PDF is ready. Gemini AI will read it <strong>directly</strong> — no text extraction needed!
-              Click <strong>"Analyze with Gemini AI"</strong> above to get your insights.
+          {/* PDF text preview */}
+          {fileType === 'pdf' && pdfText && !parseLoading && (
+            <div className="card" style={{ marginBottom: 16 }}>
+              <div className="card-header">
+                <span className="card-title">📄 Extracted Text Preview</span>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{pdfText.length.toLocaleString()} chars</span>
+              </div>
+              <div style={{ padding: '12px 16px' }}>
+                <pre style={{ fontSize: 11, color: 'var(--text-muted)', maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>
+                  {pdfText.slice(0, 600)}{pdfText.length > 600 ? '...' : ''}
+                </pre>
+              </div>
             </div>
           )}
 
