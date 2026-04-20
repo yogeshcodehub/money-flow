@@ -4,7 +4,7 @@ import { formatCurrency, getCurrentMonth } from '../utils/constants';
 import Papa from 'papaparse';
 
 // Gemini endpoints
-const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
 // Convert file to base64 string (no heavy libraries needed)
 function fileToBase64(file) {
