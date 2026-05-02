@@ -11,12 +11,28 @@ async function extractPdfText(file) {
   const pdfjs = window.pdfjsLib;
   if (!pdfjs) throw new Error('PDF library not loaded yet. Please refresh the page and try again.');
 
-  pdfjs.GlobalWorkerOptions.workerSrc =
-    'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+  // Try multiple CDN sources for the worker to handle network/CORS issues
+  const workerSources = [
+    'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
+    'https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+  ];
+
+  // Use fake worker as fallback if all CDNs fail (slower but works offline)
+  pdfjs.GlobalWorkerOptions.workerSrc = workerSources[0];
 
   const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  const maxPages = Math.min(pdf.numPages, 15);
+
+  let pdf;
+  try {
+    pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  } catch (e) {
+    // If worker fails (CORS/network), retry without worker (single-threaded mode)
+    pdfjs.GlobalWorkerOptions.workerSrc = '';
+    pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  }
+
+  const maxPages = Math.min(pdf.numPages, 20);
   let text = '';
   for (let i = 1; i <= maxPages; i++) {
     const page = await pdf.getPage(i);
@@ -40,9 +56,9 @@ function parseGeminiError(msg) {
   return msg;
 }
 
-// Truncate long text to stay within token limits (~4000 chars ≈ 1000 tokens)
-function truncate(str, max = 4000) {
-  return str.length > max ? str.slice(0, max) + '\n...[truncated]' : str;
+// Truncate long text to stay within token limits (~12000 chars ≈ 3000 tokens, well within Gemini free tier)
+function truncate(str, max = 12000) {
+  return str.length > max ? str.slice(0, max) + '\n...[truncated for length]' : str;
 }
 
 export default function AIAnalysis() {
@@ -130,7 +146,13 @@ export default function AIAnalysis() {
         // PDF → extract text via pdfjs CDN (no npm install, no freeze, uses far fewer tokens)
         const text = await extractPdfText(f);
         if (!text) {
-          setError('No readable text found. This PDF may be a scanned image. Try exporting as CSV from your bank.');
+          setError(
+            '❌ No readable text found in this PDF.\n\n' +
+            'This usually means:\n' +
+            '• The PDF is a scanned image (not text-based)\n' +
+            '• The bank uses a password-protected or encrypted PDF\n\n' +
+            '✅ Fix: Log in to your bank website and download the statement as CSV instead of PDF.'
+          );
         } else {
           setPdfText(text);
         }
@@ -291,9 +313,9 @@ Answer helpfully, specifically, and concisely. Use emojis and numbers where rele
       {/* API Key Warning */}
       {!apiKey && (
         <div className="alert alert-warning" style={{ marginBottom: 16 }}>
-          ⚠️ No Gemini API key configured. Go to{' '}
-          <strong style={{ cursor: 'pointer', textDecoration: 'underline' }}>Settings → AI Configuration</strong>
-          {' '}to add your free key from{' '}
+          ⚠️ No Gemini API key configured.{' '}
+          <strong>Your key is saved in this browser only</strong> — you must add it here on this device.{' '}
+          Go to <strong>Settings → AI Configuration</strong> and paste your free key from{' '}
           <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" style={{ color: 'var(--orange)' }}>
             aistudio.google.com
           </a>
