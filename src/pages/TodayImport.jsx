@@ -2,473 +2,438 @@ import { useState, useRef, useCallback } from 'react';
 import { useApp } from '../context/AppContext';
 import { formatCurrency } from '../utils/constants';
 
-// ─── PDF Row-Preserving Extraction ───
-async function extractPdfRows(file) {
+// PDF extraction with password support
+async function extractPdfRows(file, password) {
   const pdfjs = window.pdfjsLib;
   if (!pdfjs) throw new Error('PDF library not loaded. Please refresh.');
-
   pdfjs.GlobalWorkerOptions.workerSrc =
     'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
-
   const arrayBuffer = await file.arrayBuffer();
-  let pdf;
-  try {
-    pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  } catch {
-    pdfjs.GlobalWorkerOptions.workerSrc = '';
-    pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  }
-
-  const allLines = [];
-  const maxPages = Math.min(pdf.numPages, 20);
-
-  for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-
-    // Group items by Y coordinate to reconstruct table rows
-    const rowMap = new Map();
-    for (const item of content.items) {
-      if (!item.str.trim()) continue;
-      const y = Math.round(item.transform[5]); // PDF Y (bottom-up)
-      if (!rowMap.has(y)) rowMap.set(y, []);
-      rowMap.get(y).push({ text: item.str.trim(), x: item.transform[4] });
-    }
-
-    // Sort rows top-to-bottom (descending Y in PDF coords)
-    const sortedYs = [...rowMap.keys()].sort((a, b) => b - a);
-    for (const y of sortedYs) {
-      const items = rowMap.get(y).sort((a, b) => a.x - b.x);
-      const lineText = items.map(i => i.text).join('  ');
-      if (lineText.trim()) allLines.push(lineText.trim());
-    }
-  }
-  return allLines;
+  return new Promise((resolve, reject) => {
+    const task = pdfjs.getDocument({ data: arrayBuffer, password: password || '' });
+    task.onPassword = (_cb, reason) => reject({ isPwdError: true, isWrong: reason === 2 });
+    task.promise.then(async (pdf) => {
+      const lines = [];
+      for (let p = 1; p <= Math.min(pdf.numPages, 30); p++) {
+        const page = await pdf.getPage(p);
+        const ct = await page.getTextContent();
+        const rows = new Map();
+        for (const it of ct.items) {
+          if (!it.str.trim()) continue;
+          const y = Math.round(it.transform[5]);
+          if (!rows.has(y)) rows.set(y, []);
+          rows.get(y).push({ t: it.str.trim(), x: it.transform[4] });
+        }
+        [...rows.keys()].sort((a, b) => b - a).forEach(y => {
+          const ln = rows.get(y).sort((a, b) => a.x - b.x).map(i => i.t).join('  ');
+          if (ln.trim()) lines.push(ln.trim());
+        });
+      }
+      resolve(lines);
+    }).catch(reject);
+  });
 }
 
-// ─── Today's date in all common bank statement formats ───
-function getTodayPatterns() {
-  const t = new Date();
-  const d  = String(t.getDate()).padStart(2, '0');
-  const d1 = String(t.getDate());
-  const mo = String(t.getMonth() + 1).padStart(2, '0');
-  const m1 = String(t.getMonth() + 1);
-  const y  = t.getFullYear();
-  const yy = String(y).slice(2);
-  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const MLONG  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-  const mn  = MONTHS[t.getMonth()];
-  const mnL = MLONG[t.getMonth()];
-
+function datePatterns(d) {
+  const z = n => String(n).padStart(2, '0');
+  const day = z(d.getDate()), day1 = String(d.getDate());
+  const mon = z(d.getMonth() + 1), mon1 = String(d.getMonth() + 1);
+  const yr = d.getFullYear(), yr2 = String(d.getFullYear()).slice(2);
+  const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const ML = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const mn = MN[d.getMonth()], ml = ML[d.getMonth()];
   return [
-    `${d}/${mo}/${y}`,  `${d}-${mo}-${y}`,  `${d}.${mo}.${y}`,
-    `${d}/${mo}/${yy}`, `${d}-${mo}-${yy}`,
-    `${d1}/${m1}/${y}`, `${d1}-${m1}-${y}`,
-    `${d} ${mn} ${y}`,  `${d}-${mn}-${y}`,  `${d}/${mn}/${y}`,
-    `${d1} ${mn} ${y}`, `${d} ${mn} ${yy}`,
-    `${mn} ${d}, ${y}`, `${mn} ${d1}, ${y}`,
-    `${y}-${mo}-${d}`,  `${y}/${mo}/${d}`,
-    `${d1}-${mn}-${yy}`,`${d}-${mn}-${yy}`,
-    `${mnL} ${d}, ${y}`,`${mnL} ${d1}, ${y}`,
+    `${day}/${mon}/${yr}`, `${day}-${mon}-${yr}`, `${day}.${mon}.${yr}`,
+    `${day}/${mon}/${yr2}`, `${day}-${mon}-${yr2}`,
+    `${day1}/${mon1}/${yr}`, `${day1}-${mon1}-${yr}`,
+    `${day} ${mn} ${yr}`, `${day}-${mn}-${yr}`, `${day1} ${mn} ${yr}`,
+    `${day} ${mn} ${yr2}`, `${mn} ${day}, ${yr}`, `${mn} ${day1}, ${yr}`,
+    `${yr}-${mon}-${day}`, `${yr}/${mon}/${day}`,
+    `${ml} ${day}, ${yr}`, `${ml} ${day1}, ${yr}`,
   ];
 }
 
-// ─── Extract money amounts from a line ───
-function extractAmounts(line) {
-  // Matches: 1,234.56 | 1,23,456.00 | 1234.56 (must have decimals or comma-thousands)
-  const re = /\b(\d{1,3}(?:,\d{2,3})+(?:\.\d{0,2})?|\d+\.\d{2})\b/g;
-  const hits = [];
-  let m;
-  while ((m = re.exec(line)) !== null) {
-    const val = parseFloat(m[1].replace(/,/g, ''));
-    if (val > 0 && val < 1e8) hits.push({ value: val, idx: m.index });
+function datesInRange(from, to) {
+  const list = [], cur = new Date(from), end = new Date(to);
+  while (cur <= end) { list.push(new Date(cur)); cur.setDate(cur.getDate() + 1); }
+  return list;
+}
+
+function matchLineDate(line, dates) {
+  for (const d of dates) {
+    if (datePatterns(d).some(p => line.toLowerCase().includes(p.toLowerCase())))
+      return d.toISOString().split('T')[0];
   }
-  return hits;
+  return null;
 }
 
-// ─── Pick the most likely transaction amount ───
-// Heuristic: last amount is usually running balance; second-to-last is transaction amount
-function pickAmount(hits) {
-  if (hits.length === 0) return null;
-  if (hits.length === 1) return hits[0].value;
-  return hits[hits.length - 2].value; // second-to-last
+function pickAmt(line) {
+  const re = /\b(\d{1,3}(?:,\d{2,3})+(?:\.\d{0,2})?|\d+\.\d{2})\b/g;
+  const hits = []; let m;
+  while ((m = re.exec(line)) !== null) {
+    const v = parseFloat(m[1].replace(/,/g, ''));
+    if (v > 0 && v < 1e8) hits.push(v);
+  }
+  if (!hits.length) return null;
+  return hits.length >= 2 ? hits[hits.length - 2] : hits[0];
 }
 
-// ─── Detect income vs expense ───
 function detectType(line) {
-  if (/\bDr\.?\b|\bDEBIT\b|\bDebit\b|\bWithdraw|\bPayment\b/i.test(line)) return 'expense';
-  if (/\bCr\.?\b|\bCREDIT\b|\bCredit\b|\bDeposit|\bRefund|\bCashback/i.test(line)) return 'income';
+  if (/\bDr\.?\b|\bDEBIT\b|\bDebit\b|\bWithdraw/i.test(line)) return 'expense';
+  if (/\bCr\.?\b|\bCREDIT\b|\bCredit\b|\bDeposit|\bRefund/i.test(line)) return 'income';
   if (/\bSALARY\b|\bSal\b|\bStipend\b/i.test(line)) return 'income';
   return 'expense';
 }
 
-// ─── Keyword-based auto-category ───
 function autoCategory(desc, type) {
   const d = desc.toUpperCase();
   if (type === 'income') {
     if (/SALARY|SAL\b|STIPEND/.test(d)) return 'salary';
-    if (/FREELANCE|CONSULT/.test(d))    return 'freelance';
-    if (/INTEREST|DIVIDEND/.test(d))    return 'investment';
-    if (/REFUND|CASHBACK/.test(d))      return 'other_income';
+    if (/FREELANCE|CONSULT/.test(d)) return 'freelance';
+    if (/INTEREST|DIVIDEND/.test(d)) return 'investment';
     return 'other_income';
   }
-  if (/ZOMATO|SWIGGY|HOTEL|RESTAURANT|FOOD|CAFE|COFFEE/.test(d)) return 'food';
-  if (/UBER|OLA|METRO|BUS|RAILWAY|IRCTC|KSRTC|RAPIDO/.test(d))   return 'transport';
-  if (/AMAZON|FLIPKART|MYNTRA|NYKAA|MEESHO|SHOP|STORE/.test(d))  return 'shopping';
-  if (/RENT|LEASE/.test(d))                                         return 'rent';
-  if (/ELECTRICITY|WATER|GAS|BSNL|AIRTEL|JIO|VODAFONE/.test(d))  return 'utilities';
-  if (/HOSPITAL|CLINIC|PHARMACY|MEDIC|DOCTOR/.test(d))            return 'health';
-  if (/NETFLIX|SPOTIFY|PRIME|HOTSTAR|ZEE5|YOUTUBE/.test(d))       return 'subscriptions';
-  if (/CINEMA|MOVIE|PVR|INOX|GAME/.test(d))                       return 'entertainment';
-  if (/INSURANCE|LIC|SBI LIFE/.test(d))                           return 'insurance';
-  if (/COLLEGE|SCHOOL|TUITION|COURSE|UDEMY/.test(d))              return 'education';
+  if (/ZOMATO|SWIGGY|RESTAURANT|FOOD|CAFE|COFFEE/.test(d)) return 'food';
+  if (/UBER|OLA|METRO|RAILWAY|IRCTC|RAPIDO/.test(d)) return 'transport';
+  if (/AMAZON|FLIPKART|MYNTRA|NYKAA|MEESHO|SHOP/.test(d)) return 'shopping';
+  if (/RENT|LEASE/.test(d)) return 'rent';
+  if (/ELECTRICITY|WATER|GAS|AIRTEL|JIO|VODAFONE/.test(d)) return 'utilities';
+  if (/HOSPITAL|CLINIC|PHARMACY|MEDIC|DOCTOR/.test(d)) return 'health';
+  if (/NETFLIX|SPOTIFY|PRIME|HOTSTAR|YOUTUBE/.test(d)) return 'subscriptions';
+  if (/CINEMA|MOVIE|PVR|INOX/.test(d)) return 'entertainment';
+  if (/INSURANCE|LIC/.test(d)) return 'insurance';
+  if (/COLLEGE|SCHOOL|TUITION|COURSE|UDEMY/.test(d)) return 'education';
   return 'other_expense';
 }
 
-// ─── Strip date & amounts from line to get description ───
-function extractDescription(line, patterns) {
-  let desc = line;
-  // Remove date
-  for (const p of patterns) {
-    desc = desc.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ' ');
-  }
-  // Remove money amounts
-  desc = desc.replace(/\b\d{1,3}(?:,\d{2,3})+(?:\.\d{0,2})?\b/g, ' ');
-  desc = desc.replace(/\b\d+\.\d{2}\b/g, ' ');
-  // Remove Dr/Cr markers
-  desc = desc.replace(/\b(Dr|Cr|DR|CR)\b\.?/g, ' ');
-  // Collapse whitespace & clean up
-  desc = desc.replace(/\s{2,}/g, ' ').trim();
-  // Remove leading/trailing punctuation
-  desc = desc.replace(/^[\s\-|/\\]+|[\s\-|/\\]+$/g, '').trim();
-  return desc || 'Bank Transaction';
+function cleanDesc(line, dates) {
+  let s = line;
+  dates.forEach(d => datePatterns(d).forEach(p => {
+    try { s = s.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ' '); } catch {}
+  }));
+  s = s.replace(/\b\d{1,3}(?:,\d{2,3})+(?:\.\d{0,2})?\b/g, ' ')
+       .replace(/\b\d+\.\d{2}\b/g, ' ')
+       .replace(/\b(Dr|Cr|DR|CR)\.?\b/g, ' ')
+       .replace(/\s{2,}/g, ' ').trim()
+       .replace(/^[\s\-|/\\]+|[\s\-|/\\]+$/g, '').trim();
+  return s || 'Bank Transaction';
 }
 
-// ─── Main parser ───
-function parseTodayTransactions(lines, patterns) {
+function parseLines(lines, from, to) {
+  const dates = datesInRange(from, to);
   const results = [];
   for (const line of lines) {
-    const hasToday = patterns.some(p =>
-      line.toLowerCase().includes(p.toLowerCase())
-    );
-    if (!hasToday) continue;
-
-    const amounts = extractAmounts(line);
-    const amount  = pickAmount(amounts);
+    const dateStr = matchLineDate(line, dates);
+    if (!dateStr) continue;
+    const amount = pickAmt(line);
     if (!amount) continue;
-
-    const type   = detectType(line);
-    const desc   = extractDescription(line, patterns);
-
-    results.push({
-      id:         Date.now() + Math.random(),
-      description: desc,
-      amount,
-      type,
-      categoryId:  autoCategory(desc, type),
-      rawLine:     line,
-      selected:    true,
-    });
+    const type = detectType(line);
+    const desc = cleanDesc(line, dates);
+    results.push({ id: Date.now() + Math.random(), description: desc, amount, type, categoryId: autoCategory(desc, type), date: dateStr, selected: true });
   }
   return results;
 }
 
-// ═══════════════════════════════════════════════════
-export default function TodayImport() {
+const toISO = d => d.toISOString().split('T')[0];
+
+export default function StatementImport() {
   const { settings, categories, importTransactions } = useApp();
-  const fmt = (n) => formatCurrency(n, settings.currency);
-  const today = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' });
+  const fmt = n => formatCurrency(n, settings.currency);
+  const TODAY = new Date();
+  const MONTH_START = new Date(TODAY.getFullYear(), TODAY.getMonth(), 1);
 
-  const [step, setStep]           = useState('upload'); // upload | review | done
-  const [file, setFile]           = useState(null);
-  const [loading, setLoading]     = useState(false);
-  const [error, setError]         = useState('');
-  const [items, setItems]         = useState([]);
-  const [dragOver, setDragOver]   = useState(false);
+  const [step, setStep] = useState('configure');
+  const [file, setFile] = useState(null);
+  const [fromDate, setFromDate] = useState(toISO(MONTH_START));
+  const [toDate, setToDate] = useState(toISO(TODAY));
+  const [preset, setPreset] = useState('month');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [items, setItems] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
+  // Password modal state
+  const [showPwd, setShowPwd] = useState(false);
+  const [pwd, setPwd] = useState('');
+  const [pwdErr, setPwdErr] = useState('');
+  const [pwdLoading, setPwdLoading] = useState(false);
+
   const fileRef = useRef(null);
+  const savedFile = useRef(null);
 
-  // ─── Process PDF ───
-  const processPdf = useCallback(async (f) => {
+  const applyPreset = p => {
+    const t = new Date();
+    setPreset(p);
+    if (p === 'today') { setFromDate(toISO(t)); setToDate(toISO(t)); }
+    else if (p === '7d') { const s = new Date(t); s.setDate(t.getDate() - 6); setFromDate(toISO(s)); setToDate(toISO(t)); }
+    else if (p === 'month') { setFromDate(toISO(new Date(t.getFullYear(), t.getMonth(), 1))); setToDate(toISO(t)); }
+    else if (p === 'last') {
+      const s = new Date(t.getFullYear(), t.getMonth() - 1, 1);
+      const e = new Date(t.getFullYear(), t.getMonth(), 0);
+      setFromDate(toISO(s)); setToDate(toISO(e));
+    }
+  };
+
+  const doExtract = useCallback(async (f, password) => {
+    const lines = await extractPdfRows(f, password);
+    const found = parseLines(lines, fromDate, toDate);
+    if (!found.length) {
+      setError('No transactions found in the selected date range.\n\n• Ensure the PDF covers your selected dates\n• Text-based PDFs only (not scanned images)\n• Try a wider date range');
+      return false;
+    }
+    setItems(found);
+    setStep('review');
+    return true;
+  }, [fromDate, toDate]);
+
+  const handleFile = useCallback(async f => {
+    if (!f || f.name.split('.').pop().toLowerCase() !== 'pdf') { setError('Please upload a PDF file.'); return; }
+    savedFile.current = f;
     setFile(f);
-    setLoading(true);
     setError('');
-    setItems([]);
-
+    setLoading(true);
     try {
-      const lines    = await extractPdfRows(f);
-      const patterns = getTodayPatterns();
-      const found    = parseTodayTransactions(lines, patterns);
-
-      if (found.length === 0) {
-        setError(
-          `❌ No transactions found for today (${new Date().toLocaleDateString('en-IN')}).\n\n` +
-          `Possible reasons:\n` +
-          `• Your bank statement doesn't include today's date yet\n` +
-          `• The PDF is a scanned image (not text-based)\n` +
-          `• The date format in the PDF is unusual\n\n` +
-          `Try downloading the statement again later in the day, or use CSV import.`
-        );
-        setStep('upload');
-      } else {
-        setItems(found);
-        setStep('review');
-      }
-    } catch (err) {
-      setError('Failed to read PDF: ' + err.message);
+      await doExtract(f, '');
+    } catch (e) {
+      if (e && e.isPwdError) { setPwdErr(e.isWrong ? 'Incorrect password.' : ''); setShowPwd(true); }
+      else setError('Failed to read PDF: ' + (e?.message || String(e)));
     }
     setLoading(false);
-  }, []);
+  }, [doExtract]);
 
-  const handleFilePick = useCallback((f) => {
-    if (!f) return;
-    const ext = f.name.split('.').pop().toLowerCase();
-    if (ext !== 'pdf') { setError('❌ Please upload a PDF file.'); return; }
-    processPdf(f);
-  }, [processPdf]);
-
-  // ─── Update a review item ───
-  const updateItem = (id, field, value) => {
-    setItems(prev => prev.map(it => it.id === id ? { ...it, [field]: value } : it));
-  };
-  const toggleSelect = (id) => {
-    setItems(prev => prev.map(it => it.id === id ? { ...it, selected: !it.selected } : it));
-  };
-  const toggleAll = () => {
-    const allSelected = items.every(it => it.selected);
-    setItems(prev => prev.map(it => ({ ...it, selected: !allSelected })));
+  const submitPwd = async () => {
+    setPwdLoading(true); setPwdErr('');
+    try {
+      await doExtract(savedFile.current, pwd);
+      setShowPwd(false); setPwd('');
+    } catch (e) {
+      if (e && e.isPwdError) setPwdErr('Incorrect password. Please try again.');
+      else setError('Error: ' + (e?.message || String(e)));
+    }
+    setPwdLoading(false);
   };
 
-  // ─── Import selected ───
-  const handleImport = useCallback(() => {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const selected = items
-      .filter(it => it.selected && it.amount > 0)
-      .map(({ description, amount, type, categoryId }) => ({
-        description, amount: parseFloat(amount), type, categoryId,
-        date: todayStr,
-        note: 'Imported from bank statement PDF',
-      }));
+  const update = (id, f, v) => setItems(p => p.map(it => it.id === id ? { ...it, [f]: v } : it));
+  const toggleOne = id => setItems(p => p.map(it => it.id === id ? { ...it, selected: !it.selected } : it));
+  const toggleAll = () => { const all = items.every(i => i.selected); setItems(p => p.map(i => ({ ...i, selected: !all }))); };
 
-    if (selected.length === 0) { setError('Select at least one transaction to import.'); return; }
-    importTransactions(selected);
+  const handleImport = () => {
+    const sel = items.filter(i => i.selected && i.amount > 0)
+      .map(({ description, amount, type, categoryId, date }) => ({ description, amount: parseFloat(amount), type, categoryId, date, note: 'Imported from bank PDF' }));
+    if (!sel.length) { setError('Select at least one transaction.'); return; }
+    importTransactions(sel);
     setStep('done');
-  }, [items, importTransactions]);
+  };
 
-  const reset = () => { setStep('upload'); setFile(null); setItems([]); setError(''); };
+  const reset = () => { setStep('configure'); setFile(null); setItems([]); setError(''); setPwd(''); setShowPwd(false); savedFile.current = null; };
 
-  const selectedCount = items.filter(i => i.selected).length;
-  const expenseCats   = categories.filter(c => c.type === 'expense');
-  const incomeCats    = categories.filter(c => c.type === 'income');
+  const selCount = items.filter(i => i.selected).length;
+  const expCats = categories.filter(c => c.type === 'expense');
+  const incCats = categories.filter(c => c.type === 'income');
+  const fmtD = d => new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 
-  // ══════════════════ RENDER ══════════════════
   return (
     <div>
-      <div className="section-title">📅 Today's Import</div>
+      <div className="section-title">📥 Statement Import</div>
 
-      {/* Date banner */}
-      <div style={{
-        background: 'linear-gradient(135deg, rgba(99,102,241,0.18), rgba(168,85,247,0.12))',
-        border: '1px solid rgba(99,102,241,0.3)',
-        borderRadius: 'var(--radius)', padding: '14px 20px',
-        marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12,
-      }}>
-        <span style={{ fontSize: 26 }}>🗓️</span>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 15 }}>Importing for: {today}</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Upload your bank statement PDF — transactions dated today will be extracted automatically
+      {/* ── Password Modal ── */}
+      {showPwd && (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !pwdLoading && setShowPwd(false)}>
+          <div className="modal" style={{ maxWidth: 420 }}>
+            <div className="modal-header">
+              <h2 className="modal-title">🔐 Password Protected PDF</h2>
+            </div>
+            <div className="modal-body">
+              <div className="alert alert-info" style={{ marginBottom: 14 }}>
+                This bank statement is password protected. Enter your PDF password to unlock it.
+              </div>
+              {pwdErr && <div className="alert alert-error" style={{ marginBottom: 12 }}>{pwdErr}</div>}
+              <div className="form-group" style={{ marginBottom: 8 }}>
+                <label className="form-label">PDF Password</label>
+                <input className="form-input" type="password" placeholder="Enter PDF password"
+                  value={pwd} autoFocus
+                  onChange={e => setPwd(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && !pwdLoading && pwd && submitPwd()} />
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                💡 Usually your date of birth (DDMMYYYY) or registered mobile number — check your bank's instructions.
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-secondary" onClick={() => { setShowPwd(false); setFile(null); savedFile.current = null; }}>Cancel</button>
+              <button className="btn btn-primary" onClick={submitPwd} disabled={!pwd || pwdLoading}>
+                {pwdLoading
+                  ? <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div className="spinner animate-spin" /> Unlocking…</span>
+                  : '🔓 Unlock & Extract'}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* ── STEP 1: Upload ── */}
-      {step === 'upload' && (
+      {/* ── Configure Step ── */}
+      {step === 'configure' && (
         <div>
-          <input ref={fileRef} type="file" accept=".pdf" style={{ display: 'none' }}
-            onChange={e => { const f = e.target.files?.[0]; if (f) handleFilePick(f); e.target.value = ''; }} />
+          {/* Date range card */}
+          <div className="card" style={{ marginBottom: 16 }}>
+            <div className="card-header"><span className="card-title">📅 Select Date Range</span></div>
+            <div className="card-body">
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+                {[['today','Today'],['7d','Last 7 Days'],['month','This Month'],['last','Last Month'],['custom','Custom']].map(([id, label]) => (
+                  <button key={id} className="filter-chip" onClick={() => applyPreset(id)}
+                    style={preset === id ? { background: 'linear-gradient(135deg,var(--accent),var(--purple))', color: 'white', border: 'none' } : {}}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">From Date</label>
+                  <input className="form-input" type="date" value={fromDate} max={toDate}
+                    onChange={e => { setFromDate(e.target.value); setPreset('custom'); }} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">To Date</label>
+                  <input className="form-input" type="date" value={toDate} min={fromDate} max={toISO(TODAY)}
+                    onChange={e => { setToDate(e.target.value); setPreset('custom'); }} />
+                </div>
+              </div>
+              <div className="alert alert-info" style={{ marginTop: 4, fontSize: 13 }}>
+                📊 Extracting: <strong>{fmtD(fromDate)}</strong> → <strong>{fmtD(toDate)}</strong>
+                &nbsp;({datesInRange(fromDate, toDate).length} day{datesInRange(fromDate, toDate).length !== 1 ? 's' : ''})
+              </div>
+            </div>
+          </div>
 
-          <div
-            className={`drop-zone ${dragOver ? 'drag-over' : ''}`}
+          {/* Drop zone */}
+          <input ref={fileRef} type="file" accept=".pdf" style={{ display: 'none' }}
+            onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }} />
+          <div className={`drop-zone ${dragOver ? 'drag-over' : ''}`}
             onDragOver={e => { e.preventDefault(); setDragOver(true); }}
             onDragLeave={() => setDragOver(false)}
-            onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) handleFilePick(f); }}
-            style={{ marginBottom: 16 }}
-          >
+            onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
+            style={{ marginBottom: 16 }}>
             {loading ? (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14 }}>
                 <div className="spinner animate-spin" style={{ width: 36, height: 36 }} />
-                <div style={{ fontWeight: 600 }}>Extracting transactions from PDF…</div>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Reading rows & matching today's date</div>
+                <div style={{ fontWeight: 600 }}>Reading PDF & extracting transactions…</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Matching dates in your selected range</div>
               </div>
             ) : (
               <>
-                <div className="drop-zone-icon">📄</div>
-                <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>Drop your bank statement PDF</div>
+                <div className="drop-zone-icon">{file ? '📄' : '🏦'}</div>
+                <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>
+                  {file ? file.name : 'Drop your bank statement PDF'}
+                </div>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 16 }}>
-                  No AI needed · Processed entirely in your browser · Data never leaves your device
+                  {file ? `${(file.size / 1024).toFixed(1)} KB · Password-protected PDFs supported 🔐`
+                        : 'Supports password-protected PDFs · All processing done in your browser'}
                 </div>
                 <button type="button" className="btn btn-primary"
                   onClick={e => { e.stopPropagation(); fileRef.current?.click(); }}>
-                  📁 Browse PDF
+                  {file ? '🔄 Upload Different PDF' : '📁 Browse PDF'}
                 </button>
               </>
             )}
           </div>
 
-          {error && (
-            <div className="alert alert-error" style={{ whiteSpace: 'pre-wrap', marginBottom: 12 }}>{error}</div>
-          )}
+          {error && <div className="alert alert-error" style={{ whiteSpace: 'pre-wrap', marginBottom: 12 }}>{error}</div>}
 
           {/* How it works */}
           <div className="card">
             <div className="card-header"><span className="card-title">ℹ️ How It Works</span></div>
             <div className="card-body" style={{ paddingTop: 8 }}>
               {[
-                ['📄', 'Upload PDF', 'Your bank statement from any Indian bank (SBI, HDFC, ICICI, Axis, etc.)'],
-                ['🔍', 'Auto-Detect', 'Finds all transaction rows matching today\'s date in any format'],
-                ['✏️', 'Review & Edit', 'Preview extracted transactions, fix descriptions, amounts or categories'],
-                ['✅', 'Import', 'Selected transactions are added to your Dashboard instantly'],
+                ['📅', 'Set Date Range', 'Pick Today, Last 7 Days, This Month, Last Month, or any custom range'],
+                ['📄', 'Upload PDF', 'Your bank statement from SBI, HDFC, ICICI, Axis, Kotak, etc.'],
+                ['🔐', 'Auto Password Prompt', 'If your PDF is locked, a popup asks for your password securely'],
+                ['✏️', 'Review & Edit', 'Verify extracted transactions and fix details before importing'],
+                ['✅', 'Import', 'Selected transactions are added to your Dashboard with correct dates'],
               ].map(([icon, title, desc]) => (
-                <div key={title} style={{ display: 'flex', gap: 12, marginBottom: 14, alignItems: 'flex-start' }}>
-                  <span style={{ fontSize: 20, marginTop: 1 }}>{icon}</span>
+                <div key={title} style={{ display: 'flex', gap: 12, marginBottom: 12, alignItems: 'flex-start' }}>
+                  <span style={{ fontSize: 20 }}>{icon}</span>
                   <div>
                     <div style={{ fontWeight: 600, fontSize: 14 }}>{title}</div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{desc}</div>
                   </div>
                 </div>
               ))}
-              <div className="alert alert-info" style={{ marginTop: 4 }}>
-                💡 <strong>Tip:</strong> Works best with <strong>text-based PDFs</strong> (downloaded from bank website).
-                Scanned/image PDFs won't work — download as CSV instead.
-              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── STEP 2: Review ── */}
+      {/* ── Review Step ── */}
       {step === 'review' && (
         <div>
-          {/* Summary bar */}
-          <div style={{
-            background: 'var(--bg-card)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius)', padding: '14px 18px',
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            flexWrap: 'wrap', gap: 10, marginBottom: 16,
-          }}>
+          <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '14px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ fontSize: 22 }}>📋</span>
               <div>
-                <div style={{ fontWeight: 700 }}>
-                  Found {items.length} transaction{items.length !== 1 ? 's' : ''} for today
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  {file?.name} · Review & select before importing
-                </div>
+                <div style={{ fontWeight: 700 }}>{items.length} transaction{items.length !== 1 ? 's' : ''} found · {selCount} selected</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{file?.name} · {fmtD(fromDate)} – {fmtD(toDate)}</div>
               </div>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn btn-ghost btn-sm" onClick={reset}>↩ Re-upload</button>
-              <button className="btn btn-primary" onClick={handleImport}
-                disabled={selectedCount === 0}>
-                ✅ Import {selectedCount > 0 ? `${selectedCount} Selected` : ''}
-              </button>
+              <button className="btn btn-primary" onClick={handleImport} disabled={!selCount}>✅ Import {selCount > 0 ? `${selCount} Selected` : ''}</button>
             </div>
           </div>
 
           {error && <div className="alert alert-error" style={{ marginBottom: 12 }}>{error}</div>}
 
-          {/* Table */}
           <div className="card" style={{ marginBottom: 16 }}>
             <div className="card-header" style={{ padding: '12px 16px' }}>
               <span className="card-title">Transaction Preview</span>
               <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', color: 'var(--text-secondary)' }}>
-                <input type="checkbox" checked={items.every(i => i.selected)}
-                  onChange={toggleAll} style={{ accentColor: 'var(--accent)' }} />
+                <input type="checkbox" checked={items.every(i => i.selected)} onChange={toggleAll} style={{ accentColor: 'var(--accent)' }} />
                 Select All
               </label>
             </div>
-
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                    {['', 'Description', 'Amount', 'Type', 'Category'].map(h => (
+                    {['', 'Date', 'Description', 'Amount', 'Type', 'Category'].map(h => (
                       <th key={h} style={{ padding: '10px 12px', textAlign: 'left', color: 'var(--text-muted)', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {items.map((item) => {
-                    const cats = item.type === 'income' ? incomeCats : expenseCats;
+                  {items.map(item => {
+                    const cats = item.type === 'income' ? incCats : expCats;
                     return (
-                      <tr key={item.id} style={{
-                        borderBottom: '1px solid var(--border)',
-                        background: item.selected ? 'transparent' : 'rgba(0,0,0,0.15)',
-                        opacity: item.selected ? 1 : 0.5,
-                        transition: 'all 0.2s',
-                      }}>
-                        {/* Checkbox */}
+                      <tr key={item.id} style={{ borderBottom: '1px solid var(--border)', opacity: item.selected ? 1 : 0.45, transition: 'opacity 0.2s' }}>
                         <td style={{ padding: '10px 12px' }}>
-                          <input type="checkbox" checked={item.selected}
-                            onChange={() => toggleSelect(item.id)}
-                            style={{ accentColor: 'var(--accent)', width: 16, height: 16, cursor: 'pointer' }} />
+                          <input type="checkbox" checked={item.selected} onChange={() => toggleOne(item.id)} style={{ accentColor: 'var(--accent)', width: 16, height: 16, cursor: 'pointer' }} />
                         </td>
-
-                        {/* Description */}
+                        <td style={{ padding: '10px 12px', whiteSpace: 'nowrap', fontSize: 12, color: 'var(--text-muted)' }}>
+                          {new Date(item.date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}
+                        </td>
                         <td style={{ padding: '10px 12px', minWidth: 180 }}>
-                          <input
-                            className="form-input"
-                            style={{ fontSize: 13, padding: '6px 10px', minWidth: 160 }}
-                            value={item.description}
-                            onChange={e => updateItem(item.id, 'description', e.target.value)}
-                          />
+                          <input className="form-input" style={{ fontSize: 13, padding: '6px 10px', minWidth: 160 }}
+                            value={item.description} onChange={e => update(item.id, 'description', e.target.value)} />
                         </td>
-
-                        {/* Amount */}
-                        <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
-                          <input
-                            type="number" min="0" step="0.01"
-                            className="form-input"
+                        <td style={{ padding: '10px 12px' }}>
+                          <input type="number" min="0" step="0.01" className="form-input"
                             style={{ fontSize: 13, padding: '6px 10px', width: 110 }}
-                            value={item.amount}
-                            onChange={e => updateItem(item.id, 'amount', e.target.value)}
-                          />
+                            value={item.amount} onChange={e => update(item.id, 'amount', e.target.value)} />
                         </td>
-
-                        {/* Type toggle */}
                         <td style={{ padding: '10px 12px' }}>
                           <div className="type-toggle" style={{ minWidth: 140 }}>
-                            <button type="button"
-                              className={`type-btn expense ${item.type === 'expense' ? 'active' : ''}`}
-                              onClick={() => {
-                                updateItem(item.id, 'type', 'expense');
-                                updateItem(item.id, 'categoryId', autoCategory(item.description, 'expense'));
-                              }}>
+                            <button type="button" className={`type-btn expense ${item.type === 'expense' ? 'active' : ''}`}
+                              onClick={() => { update(item.id, 'type', 'expense'); update(item.id, 'categoryId', autoCategory(item.description, 'expense')); }}>
                               Expense
                             </button>
-                            <button type="button"
-                              className={`type-btn income ${item.type === 'income' ? 'active' : ''}`}
-                              onClick={() => {
-                                updateItem(item.id, 'type', 'income');
-                                updateItem(item.id, 'categoryId', autoCategory(item.description, 'income'));
-                              }}>
+                            <button type="button" className={`type-btn income ${item.type === 'income' ? 'active' : ''}`}
+                              onClick={() => { update(item.id, 'type', 'income'); update(item.id, 'categoryId', autoCategory(item.description, 'income')); }}>
                               Income
                             </button>
                           </div>
                         </td>
-
-                        {/* Category */}
                         <td style={{ padding: '10px 12px' }}>
-                          <select
-                            className="form-select"
-                            style={{ fontSize: 13, padding: '6px 10px', minWidth: 150 }}
-                            value={item.categoryId}
-                            onChange={e => updateItem(item.id, 'categoryId', e.target.value)}
-                          >
-                            {cats.map(c => (
-                              <option key={c.id} value={c.id}>{c.emoji} {c.name}</option>
-                            ))}
+                          <select className="form-select" style={{ fontSize: 13, padding: '6px 10px', minWidth: 150 }}
+                            value={item.categoryId} onChange={e => update(item.id, 'categoryId', e.target.value)}>
+                            {cats.map(c => <option key={c.id} value={c.id}>{c.emoji} {c.name}</option>)}
                           </select>
                         </td>
                       </tr>
@@ -479,35 +444,30 @@ export default function TodayImport() {
             </div>
           </div>
 
-          {/* Raw lines info */}
           <div className="alert alert-info" style={{ fontSize: 12 }}>
-            💡 The descriptions are auto-extracted from the PDF. Edit any field above before importing.
-            Categories are auto-detected from keywords (UPI, Swiggy, Salary, etc.)
+            💡 Each transaction is saved with its actual date from the PDF. Edit any field before importing.
           </div>
-
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
             <button className="btn btn-secondary" onClick={reset}>↩ Re-upload</button>
-            <button className="btn btn-primary" onClick={handleImport}
-              disabled={selectedCount === 0} style={{ minWidth: 180 }}>
-              ✅ Import {selectedCount} Transaction{selectedCount !== 1 ? 's' : ''} to Dashboard
+            <button className="btn btn-primary" onClick={handleImport} disabled={!selCount} style={{ minWidth: 200 }}>
+              ✅ Import {selCount} Transaction{selCount !== 1 ? 's' : ''} to Dashboard
             </button>
           </div>
         </div>
       )}
 
-      {/* ── STEP 3: Done ── */}
+      {/* ── Done Step ── */}
       {step === 'done' && (
         <div style={{ textAlign: 'center', padding: '60px 20px' }}>
           <div style={{ fontSize: 64, marginBottom: 16 }}>🎉</div>
-          <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 8 }}>
-            Import Successful!
-          </div>
+          <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 8 }}>Import Successful!</div>
           <div style={{ color: 'var(--text-muted)', marginBottom: 28, fontSize: 15 }}>
-            {selectedCount} transaction{selectedCount !== 1 ? 's' : ''} from today have been added to your dashboard.
+            {selCount} transaction{selCount !== 1 ? 's' : ''} imported from {fmtD(fromDate)} to {fmtD(toDate)}
           </div>
           <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-            <button className="btn btn-secondary" onClick={reset}>📄 Import Another PDF</button>
-            <button className="btn btn-primary" onClick={() => window.dispatchEvent(new CustomEvent('navigate', { detail: 'Dashboard' }))}>
+            <button className="btn btn-secondary" onClick={reset}>📄 Import Another</button>
+            <button className="btn btn-primary"
+              onClick={() => window.dispatchEvent(new CustomEvent('navigate', { detail: 'Dashboard' }))}>
               📊 View Dashboard
             </button>
           </div>
@@ -516,4 +476,3 @@ export default function TodayImport() {
     </div>
   );
 }
-

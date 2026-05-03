@@ -40,7 +40,7 @@ const PAGE_TITLES = {
   Analytics: { title: 'Analytics', sub: 'Visualize your spending patterns' },
   Budgets: { title: 'Budgets', sub: 'Set and track monthly limits' },
   Recurring: { title: 'Recurring', sub: 'Automatic transactions' },
-  TodayImport: { title: "Today's Import", sub: "Extract today's transactions from your bank PDF" },
+  TodayImport: { title: 'Statement Import', sub: 'Extract transactions from bank PDF by date range' },
   'AI Analysis': { title: 'AI Analysis', sub: 'Powered by Google Gemini' },
   Settings: { title: 'Settings', sub: 'Customize your experience' },
 };
