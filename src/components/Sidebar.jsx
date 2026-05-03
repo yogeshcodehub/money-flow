@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { label: 'Analytics', icon: '📊', page: 'Analytics' },
   { label: 'Budgets', icon: '🎯', page: 'Budgets' },
   { label: 'Recurring', icon: '🔄', page: 'Recurring' },
+  { label: "Today's Import", icon: '📥', page: 'TodayImport' },
   { label: 'AI Analysis', icon: '🤖', page: 'AI Analysis' },
   { label: 'Settings', icon: '⚙️', page: 'Settings' },
 ];

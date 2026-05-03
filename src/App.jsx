@@ -1,4 +1,4 @@
-import { useState, Component } from 'react';
+import { useState, useEffect, Component } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import Sidebar from './components/Sidebar';
 import Dashboard from './pages/Dashboard';
@@ -7,6 +7,7 @@ import Analytics from './pages/Analytics';
 import Budgets from './pages/Budgets';
 import Recurring from './pages/Recurring';
 import AIAnalysis from './pages/AIAnalysis';
+import TodayImport from './pages/TodayImport';
 import Settings from './pages/Settings';
 
 // Catches any crash and shows a friendly message instead of a blank screen
@@ -39,6 +40,7 @@ const PAGE_TITLES = {
   Analytics: { title: 'Analytics', sub: 'Visualize your spending patterns' },
   Budgets: { title: 'Budgets', sub: 'Set and track monthly limits' },
   Recurring: { title: 'Recurring', sub: 'Automatic transactions' },
+  TodayImport: { title: "Today's Import", sub: "Extract today's transactions from your bank PDF" },
   'AI Analysis': { title: 'AI Analysis', sub: 'Powered by Google Gemini' },
   Settings: { title: 'Settings', sub: 'Customize your experience' },
 };
@@ -47,7 +49,15 @@ function AppInner() {
   const [page, setPage] = useState('Dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { settings, updateSettings } = useApp();
-  const info = PAGE_TITLES[page];
+  const info = PAGE_TITLES[page] || PAGE_TITLES['Dashboard'];
+
+  // Allow child pages to trigger navigation via custom event
+  useEffect(() => {
+    const handler = (e) => setPage(e.detail);
+    window.addEventListener('navigate', handler);
+    return () => window.removeEventListener('navigate', handler);
+  }, []);
+
 
   const renderPage = () => {
     switch (page) {
@@ -56,6 +66,7 @@ function AppInner() {
       case 'Analytics': return <Analytics />;
       case 'Budgets': return <Budgets />;
       case 'Recurring': return <Recurring />;
+      case 'TodayImport': return <TodayImport />;
       case 'AI Analysis': return <AIAnalysis />;
       case 'Settings': return <Settings />;
       default: return <Dashboard />;
