@@ -4,7 +4,7 @@ import { formatCurrency, getCurrentMonth } from '../utils/constants';
 import Papa from 'papaparse';
 
 // Gemini model
-const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
 // Extract text from PDF using pdfjs loaded as global via index.html script tag
 async function extractPdfText(file) {
