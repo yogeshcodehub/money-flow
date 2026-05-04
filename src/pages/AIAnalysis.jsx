@@ -3,8 +3,13 @@ import { useApp } from '../context/AppContext';
 import { formatCurrency, getCurrentMonth } from '../utils/constants';
 import Papa from 'papaparse';
 
-// Gemini model
-const GEMINI_FLASH = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+// Gemini models in priority order — first available one wins
+const GEMINI_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+];
+const BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 // Extract text from PDF using pdfjs loaded as global via index.html script tag
 async function extractPdfText(file) {
@@ -50,8 +55,8 @@ function parseGeminiError(msg) {
   if (msg.includes('API_KEY_INVALID') || msg.includes('invalid api key')) {
     return '❌ Invalid API key. Please check your key in Settings → AI Configuration.';
   }
-  if (msg.includes('not found') || msg.includes('404')) {
-    return '❌ Gemini model not found. Please try again — the API may be temporarily unavailable.';
+  if (msg.includes('not found') || msg.includes('404') || msg.includes('no longer available') || msg.includes('deprecated')) {
+    return '❌ The AI model is temporarily unavailable. Please try again in a moment.';
   }
   return msg;
 }
@@ -171,27 +176,39 @@ export default function AIAnalysis() {
     if (dropped) handleFile(dropped);
   }, [handleFile]);
 
-  // ─── Call Gemini API ───
+  // ─── Call Gemini API (tries each model in order until one works) ───
   const callGemini = useCallback(async (parts) => {
     if (!apiKey) throw new Error('No Gemini API key. Go to Settings → AI Configuration to add your free key.');
 
-    const res = await fetch(`${GEMINI_FLASH}?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
-      }),
-    });
+    let lastError = '';
+    for (const model of GEMINI_MODELS) {
+      const url = `${BASE}/${model}:generateContent?key=${apiKey}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts }],
+          generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+        }),
+      });
 
-    if (!res.ok) {
-      const errJson = await res.json().catch(() => ({}));
-      const msg = errJson?.error?.message || `API Error ${res.status}`;
-      throw new Error(msg);
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        const msg = errJson?.error?.message || `API Error ${res.status}`;
+        // If model is unavailable/deprecated, try the next one
+        if (msg.includes('no longer available') || msg.includes('deprecated') ||
+            msg.includes('not found') || res.status === 404 || res.status === 400) {
+          lastError = msg;
+          continue;
+        }
+        throw new Error(msg);
+      }
+
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from AI.';
     }
 
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from AI.';
+    throw new Error(lastError || 'All Gemini models are currently unavailable. Please try again later.');
   }, [apiKey]);
 
   // ─── Analyze uploaded statement ───
